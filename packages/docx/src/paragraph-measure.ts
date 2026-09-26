@@ -236,9 +236,14 @@ export function measureParagraph(
   });
   if (segments.length === 0) return measureMarkOnly();
 
+  // An inline WPS shape (`inlineShape`, e.g. an spAutoFit code-block textbox)
+  // is an object-only line exactly like an inline picture — see the matching
+  // note at line-layout.ts's `lineHasInlinePicture` accumulation, which this
+  // `paragraphMarkSinglePx` feeds into.
   if (context.lineSpacing?.rule === 'auto'
     && context.lineSpacing.value > 1
-    && segments.some((segment) => 'imagePath' in segment && segment.inlinePicture === true)) {
+    && segments.some((segment) =>
+      'imagePath' in segment && (segment.inlinePicture === true || segment.inlineShape === true))) {
     // An image-only line has no text segment from which to obtain the authored
     // single-line height. Measure its paragraph mark through the same selected
     // face service as an empty paragraph, without the auto multiplier or grid.
@@ -249,7 +254,7 @@ export function measureParagraph(
       environment.layoutServices?.text, environment.paragraphMarkShapeInput,
     ).advancePx;
     for (const segment of segments) {
-      if ('imagePath' in segment && segment.inlinePicture === true) {
+      if ('imagePath' in segment && (segment.inlinePicture === true || segment.inlineShape === true)) {
         segment.paragraphMarkSinglePx = markSinglePx;
       }
     }

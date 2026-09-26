@@ -5016,7 +5016,21 @@ export function layoutLines(
       latinLineHomogeneous = false;
     }
     if (h > lineHeight) lineHeight = h;
-    if ('imagePath' in s && s.inlinePicture === true) {
+    // WORD_INLINE_PICTURE_AUTO_LEADING (line-compatibility.ts): a line whose
+    // only content is a non-text object gets its auto leading ADDED to the
+    // object's natural height, not MULTIPLIED against it. An inline WPS shape
+    // (`inlineShape`, e.g. an spAutoFit code-block textbox) is the same kind
+    // of object-only line as an inline picture — both replace, rather than
+    // sit alongside, the paragraph's text baseline. Before this fix, only
+    // `inlinePicture` triggered the additive rule below; an inline shape fell
+    // through to the plain `natural * multiple` branch in `lineBoxHeight`,
+    // inflating its reserved line height by the auto multiplier (e.g. a
+    // 354pt-tall spAutoFit textbox at line=1.3auto claimed ~460pt — 30% more
+    // space than its actual content — which was enough to push it onto a
+    // fresh page even though it and the preceding image fit on one page in
+    // Word; 2026-09-26, real collab.docx: Office renders 4 pages, we rendered
+    // 5 until this fix).
+    if ('imagePath' in s && (s.inlinePicture === true || s.inlineShape === true)) {
       lineHasInlinePicture = true;
       linePictureMarkSingle = Math.max(
         linePictureMarkSingle, (s.paragraphMarkSinglePx ?? 0) * scale,
