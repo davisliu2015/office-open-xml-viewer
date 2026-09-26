@@ -1162,6 +1162,10 @@ export interface ParagraphAcquisitionOptions {
     'page' | 'margin' | 'column' | 'pageParity'
   >>;
   readonly acquireCompleteStory?: CompleteTextBoxStoryAcquirer;
+  /** Pre-measured fitted heights for inline spAutoFit shapes, keyed by run index.
+   * Populated by `acquireParagraphResult` before line-breaking begins and forwarded
+   * into the environment so `buildSegments` can reserve the correct box height. */
+  readonly _inlineSpAutoFitHeightsPt?: ReadonlyMap<number, number>;
 }
 
 function runSource(source: SourceRef, runIndex: number): SourceRef {
@@ -4285,6 +4289,54 @@ export function acquireParagraphResult(
   const acquisitionOptions = numberingPlan && !options.context.numberingMarkerGeometry
     ? { ...options, context: { ...options.context, numberingMarkerGeometry: numberingPlan } }
     : options;
+
+  // Pre-measure inline spAutoFit shapes so line-breaking uses the real fitted
+  // height instead of the authored wp:extent placeholder.
+  //
+  // ECMA-376 §21.1.2.1.1 `<a:spAutoFit/>`: the text body's bounding box grows
+  // to fit its content. Word IGNORES the wp:extent cy for this case and sizes
+  // the inline drawing from the laid-out text. Our line-breaker uses heightPt
+  // from buildSegments to compute the line box height; if that value is 454 pt
+  // (16 cm — the editor default), a single code block inflates to a full page.
+  //
+  // Strategy: call acquireShapeTextBoxLayout with the authored rect before
+  // convergeExactState. When textAutofit === 'sp' the returned flowBounds will
+  // carry the fitted height. Pass those heights through the environment so
+  // buildSegments can substitute them (line-layout.ts inlineSpAutoFitHeightsPt).
+  // Then, inside paragraphLayoutFromMeasurement, use the same map to replace
+  // authoredShapeRect.heightPt with the fitted value so the drawing and
+  // text-box layout share identical geometry.
+  const inlineSpAutoFitHeightsPt = new Map<number, number>();
+  paragraph.runs.forEach((run, runIndex) => {
+    if (run.type !== 'shape' || run.inline !== true || run.textAutofit !== 'sp') return;
+    const probeRect: LayoutRect = {
+      xPt: 0, yPt: 0,
+      widthPt: run.widthPt,
+      heightPt: run.heightPt,
+    };
+    const probeTextBox = acquireShapeTextBoxLayout(run, probeRect, {
+      id: `${options.id}:autofit-probe:${runIndex}`,
+      source: options.source,
+      flowDomainId: options.flowDomainId,
+      context: options.context,
+      measurer: options.measurer,
+      environment: options.environment,
+      input: (run as import('./types.js').DeepReadonly<ShapeRun> & {
+        textBoxInput?: TextBoxAcquisitionInput;
+      }).textBoxInput,
+      acquireCompleteStory: options.acquireCompleteStory,
+    });
+    if (probeTextBox && probeTextBox.flowBounds.heightPt > 0) {
+      inlineSpAutoFitHeightsPt.set(runIndex, probeTextBox.flowBounds.heightPt);
+    }
+  });
+  const spAutoFitEnv = inlineSpAutoFitHeightsPt.size > 0
+    ? { ...options.environment, inlineSpAutoFitHeightsPt }
+    : options.environment;
+  const acquisitionOptionsWithAutoFit = inlineSpAutoFitHeightsPt.size > 0
+    ? { ...acquisitionOptions, environment: spAutoFitEnv, _inlineSpAutoFitHeightsPt: inlineSpAutoFitHeightsPt }
+    : acquisitionOptions;
+
   type Pass = Readonly<{
     measured: MeasuredParagraph;
     layout: ParagraphLayout;
@@ -4301,11 +4353,11 @@ export function acquireParagraphResult(
         );
         const measured = measureParagraph(
           paragraph,
-          acquisitionOptions.context,
+          acquisitionOptionsWithAutoFit.context,
           measurementPlacement(options, effectiveExclusions),
           options.measurer,
           {
-            ...options.environment,
+            ...spAutoFitEnv,
             paragraphMarkShapeInput: paragraph.paragraphMarkShapeInput,
             ...(numberingPlan?.shape && numberingPlan.markerText ? {
               firstLineNumberingMarkerBox: {
@@ -4316,7 +4368,7 @@ export function acquireParagraphResult(
           },
           continuation,
         );
-        const layout = paragraphLayoutFromMeasurement(paragraph, acquisitionOptions, measured);
+        const layout = paragraphLayoutFromMeasurement(paragraph, acquisitionOptionsWithAutoFit, measured);
         const ownedExclusions = canonicalOwnedExclusions(layout, occurrenceIds);
         const nextEffectiveExclusions = mergeParagraphExclusions(
           options.exclusions,
@@ -4802,7 +4854,20 @@ export function paragraphLayoutFromMeasurement(
       // The wp:inline extent is the line-flow contract. A WPS text body may
       // acquire richer internal geometry, but it must not move or resize the
       // outer inline object after the line breaker has committed its advance.
-      const shapeRect = run.inline === true ? authoredShapeRect : textBox?.flowBounds ?? authoredShapeRect;
+      //
+      // Exception: inline spAutoFit shapes. Their authored wp:extent cy is a
+      // placeholder (16 cm default). The actual fitted height was pre-measured
+      // above in acquireParagraphResult and is available via
+      // options._inlineSpAutoFitHeightsPt. Use it so the drawing geometry
+      // matches what buildSegments reserved in the line box.
+      const spAutoFitHeight = run.inline === true && run.textAutofit === 'sp'
+        ? options._inlineSpAutoFitHeightsPt?.get(runIndex)
+        : undefined;
+      const shapeRect = run.inline === true
+        ? (spAutoFitHeight !== undefined
+            ? { ...authoredShapeRect, heightPt: spAutoFitHeight }
+            : authoredShapeRect)
+        : textBox?.flowBounds ?? authoredShapeRect;
       let drawing = drawingForShape(run, shapeRect, options, runIndex, run.inline === true);
       if (textBox) {
         textBoxes.push(textBox);

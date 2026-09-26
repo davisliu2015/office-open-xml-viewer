@@ -732,6 +732,13 @@ export interface LineLayoutEnvironment {
   readonly characterSpacingControl?: string;
   /** §17.15.3.31: use full character width when deciding line fit. */
   readonly lineWrapLikeWord6?: boolean;
+  /** Pre-measured fitted heights (pt) for inline `<wps:wsp>` shapes that carry
+   * `<a:spAutoFit/>` (`textAutofit === 'sp'`). Keyed by run index within the
+   * paragraph. When present, `buildSegments` substitutes the fitted height for
+   * the authored `wp:extent` cy value so the line-breaker sees the correct box
+   * height instead of the over-declared 16 cm placeholder that inflates page count.
+   * Absent when no inline spAutoFit shapes exist in the paragraph (common case). */
+  readonly inlineSpAutoFitHeightsPt?: ReadonlyMap<number, number>;
   /** See WORD_OPENTYPE_FEATURES_COMPAT_KERNING for absent `w:kern`. */
   readonly enableOpenTypeFeatures?: boolean;
   /** False only when `w:framePr` specifies a drop cap with a fixed `w:lines`;
@@ -3870,11 +3877,20 @@ export function buildSegments(
       // Reserve its extent in the same line-breaking path as an inline picture;
       // paragraph acquisition replaces the sentinel with a retained drawing
       // placement at the resolved pen position.
+      //
+      // For `<a:spAutoFit/>` shapes the authored wp:extent cy is a placeholder
+      // (often 16 cm, the default box size written by the editor regardless of
+      // content). The actual height is only known after the text body is laid
+      // out. `paragraph.ts` pre-measures those shapes before calling
+      // `measureParagraph` and passes the fitted heights through
+      // `environment.inlineSpAutoFitHeightsPt`. Substitute here so the
+      // line-breaker reserves the right box height and page count matches Word.
+      const fittedHeightPt = environment.inlineSpAutoFitHeightsPt?.get(runIndex);
       segs.push({
         imagePath: '',
         mimeType: '',
         widthPt: run.widthPt,
-        heightPt: run.heightPt,
+        heightPt: fittedHeightPt ?? run.heightPt,
         anchor: false,
         anchorXPt: 0,
         anchorYPt: 0,
