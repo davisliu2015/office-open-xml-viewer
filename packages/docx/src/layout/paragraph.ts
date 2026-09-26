@@ -4828,7 +4828,23 @@ export function paragraphLayoutFromMeasurement(
         }, ...lines.slice(1)];
       }
     }
-    if (run.type === 'shape' && !run.anchorAcquisitionInput && !options.continuesFromPrevious) {
+    // The `run.inline === true` disjunct here is deliberately narrower than
+    // the legacy-anchored branch below: an inline shape's own LINE may fall on
+    // either side of a mid-paragraph pagination split, so it must be re-checked
+    // on every fragment (continuation or not) via `inlinePlacement` — the
+    // per-fragment `lines` list is authoritative for where THIS run actually
+    // landed. A legacy-anchored (VML-style, non-inline, no
+    // `anchorAcquisitionInput`) shape is position-independent and always
+    // resolved once during the paragraph's FIRST fragment; re-entering this
+    // block for it on a later continuation fragment would draw it a second
+    // time (regression guarded by `layout-lines-reuse-identity.test.ts`
+    // "draws a paragraph anchor once for a re-wrapped continuation"), so that
+    // path keeps the original `!options.continuesFromPrevious` gate.
+    if (
+      run.type === 'shape'
+      && !run.anchorAcquisitionInput
+      && (run.inline === true || !options.continuesFromPrevious)
+    ) {
       // Resolve the point-space box once. Shape panel paint, retained textbox
       // flow, and the line's drawing placement must own identical geometry.
       const drawingId = `${options.id}:drawing:${runIndex}`;
@@ -4837,6 +4853,23 @@ export function paragraphLayoutFromMeasurement(
             placement.kind === 'drawing' && placement.drawingId === drawingId)
         : undefined;
       if (run.inline === true && !inlinePlacement) {
+        // A continuation fragment's `measured`/`lines` only cover the paragraph's
+        // REMAINDER from the split boundary onward (measureParagraph re-measures
+        // starting at `continuation.boundary`, not the whole paragraph). An
+        // inline shape run positioned BEFORE that boundary was already placed
+        // by an earlier fragment and legitimately has no placement here —
+        // skip it instead of erroring.
+        //
+        // Bug this fixes (2026-09-26): the old code gated this entire block on
+        // `!options.continuesFromPrevious`, unconditionally skipping EVERY
+        // inline shape on ANY continuation fragment — including one whose own
+        // line falls AFTER the split boundary (i.e. IS part of this
+        // continuation's lines, and IS found by `inlinePlacement` above). That
+        // silently dropped the shape's drawing+textbox entirely whenever a
+        // paragraph's line-level split boundary landed before the shape's own
+        // line, which our spAutoFit height fix made newly reachable by
+        // changing which line ends up on which side of a page break.
+        if (options.continuesFromPrevious) return;
         throw new Error(`Inline shape ${drawingId} has no retained line placement`);
       }
       const authoredShapeRect = inlinePlacement?.bounds ?? resolvedShapeLayoutRect(run, options);
