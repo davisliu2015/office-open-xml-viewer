@@ -335,10 +335,36 @@ impl NumberingMap {
                 continue;
             };
             let abs_id: u32 = abs_id_s.parse().unwrap_or(0);
-            let mut levels = vec![];
+            let mut levels: Vec<LevelDef> = vec![];
             for lvl_node in children_w(abs_node, "lvl") {
-                let depth = levels.len();
-                levels.push(parse_level_def(lvl_node, depth, &pic_bullets));
+                // ECMA-376 §17.9.6 `<w:lvl w:ilvl>` — the level's DECLARED depth
+                // (0-8, capped by ST_Ilvl §17.18.38). This is the slot `get_level`
+                // indexes into later (`levels.get(level as usize)`), so it must be
+                // read from the attribute — NOT assumed from file order.
+                //
+                // Bug fixed 2026-09-26: this used to be `let depth = levels.len()`
+                // (i.e. "the Nth <w:lvl> element in the file becomes slot N"). That
+                // silently produces the WRONG level whenever a document's <w:lvl>
+                // elements aren't already serialized in ascending ilvl order — seen
+                // in a real WPS/飞书-produced .docx where every abstractNum's levels
+                // were shuffled. A paragraph declaring `<w:ilvl w:val="0"/>` then
+                // resolved to whatever level happened to be written FIRST in the
+                // file (e.g. lowerLetter/lowerRoman instead of the declared
+                // chineseCountingThousand/decimal) — and since the wrong LevelDef is
+                // a fixed object, unrelated paragraphs on the same numId all showed
+                // the identical wrong marker text instead of counting up.
+                //
+                // `unwrap_or(levels.len())` keeps the old file-order behavior as a
+                // fallback only for the (spec-invalid) case where `w:ilvl` is
+                // missing entirely.
+                let ilvl: usize = attr_w(lvl_node, "ilvl")
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(levels.len());
+                let def = parse_level_def(lvl_node, ilvl, &pic_bullets);
+                if levels.len() <= ilvl {
+                    levels.resize_with(ilvl + 1, LevelDef::default);
+                }
+                levels[ilvl] = def;
             }
             map.abstract_nums.insert(abs_id, levels);
         }
