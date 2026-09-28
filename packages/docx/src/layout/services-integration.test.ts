@@ -92,6 +92,16 @@ describe('production layout service integration', () => {
   });
 
   it('keeps cross-slot scalar spans in one unbreakable grapheme', () => {
+    // The base character and its combining mark classify into different
+    // rFonts slots (ASCII vs highAnsi per ECMA-376 §17.3.2.26), but they are
+    // ONE grapheme cluster with no boundary between them. text.ts's shape()
+    // now refuses to split a span mid-cluster (2026-09-28: splitting used to
+    // require gluing them back together downstream via `joinPrev`, and for
+    // emoji ZWJ sequences the same per-codepoint split broke the ligature
+    // entirely since each half painted through a separate canvas fillText()
+    // call — see font-service.test.ts). So this now naturally comes back as
+    // ONE segment carrying the base character's font, without needing a
+    // `joinPrev` stitch at all.
     const ctx = measureContext();
     const services = createLayoutServices(model(), { measureContext: ctx });
     const segments = buildSegments([textRun('a\u0301', {
@@ -103,12 +113,11 @@ describe('production layout service integration', () => {
     expect(text.map((segment) => 'text' in segment
       ? [segment.text, segment.fontFamily, segment.joinPrev ?? false]
       : null)).toEqual([
-        ['a', 'ASCII Face', false],
-        ['\u0301', 'HANSI Face', true],
+        ['a\u0301', 'ASCII Face', false],
       ]);
     const lines = layoutLines(ctx, segments, 8, 0, 1);
     expect(lines).toHaveLength(1);
-    expect(lines[0].segments.map((segment) => 'text' in segment ? segment.text : '')).toEqual(['a', '\u0301']);
+    expect(lines[0].segments.map((segment) => 'text' in segment ? segment.text : '')).toEqual(['a\u0301']);
   });
 
   it('normalizes service-backed w:sym private encoding before measurement and paint', () => {

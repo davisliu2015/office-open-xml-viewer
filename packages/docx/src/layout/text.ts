@@ -754,11 +754,31 @@ export function createTextLayoutService(input: TextLayoutServiceInput): TextLayo
           eastAsiaCharset,
         );
         const previous = grouped.at(-1);
-        if (previous?.script === script) {
+        const atClusterStart = graphemeStarts.has(start);
+        // A codepoint that does NOT start a new grapheme cluster (combining
+        // marks, variation selectors, and — critically — the ZERO WIDTH
+        // JOINER inside an emoji ZWJ sequence) must stay in the SAME span as
+        // the cluster it belongs to, even when its own scriptSlot() differs
+        // from the cluster's base character. ZWJ (U+200D) sits in the General
+        // Punctuation block, which this table defaults to 'highAnsi', while
+        // the emoji on either side (supplementary plane) are always
+        // 'eastAsia' — splitting on that mismatch used to break a 3-codepoint
+        // ZWJ sequence like "👩‍💻" into 3 spans painted via 3 separate
+        // canvas fillText() calls (see paint/canvas-drawing.ts), and a
+        // separate fillText() call per codepoint prevents the browser's text
+        // shaper from ever seeing the whole cluster to compose the ligature —
+        // real Office renders it as one glyph; ours rendered as loose
+        // "👩" + "💻" (2026-09-28 user screenshot comparison against real
+        // Office found the DOCX-side native-engine panel disagreeing with
+        // both Office and our own MD/KaTeX panel, which agreed with each
+        // other). Only ever MERGE across a script mismatch when we are mid
+        // cluster; a genuine grapheme boundary still starts a new span
+        // whenever the script changes, exactly as before.
+        if (previous && (!atClusterStart || previous.script === script)) {
           previous.text += character;
           previous.end = end;
         } else {
-          grouped.push({ text: character, start, end, script, breakBefore: graphemeStarts.has(start) });
+          grouped.push({ text: character, start, end, script, breakBefore: atClusterStart });
         }
         start = end;
       }

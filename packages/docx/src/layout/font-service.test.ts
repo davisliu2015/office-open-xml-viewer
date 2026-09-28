@@ -324,13 +324,21 @@ describe('font layout services', () => {
       },
     });
 
+    // A base character + combining mark is ONE grapheme cluster (no boundary
+    // between them — graphemeBoundaries below is [0, 2], not [0, 1, 2]).
+    // scriptSlot() alone would classify 'a' as ascii and the combining acute
+    // as highAnsi, but splitting a mid-cluster codepoint into its own span
+    // would mean the browser draws them via two separate fillText() calls,
+    // which breaks the base+mark composition (and, for emoji ZWJ sequences
+    // below, breaks the ligature entirely — 2026-09-28 real repro). The whole
+    // cluster must stay one span, carrying the base character's script.
     expect(shape('a\u0301').spans.map((span) => [span.text, span.script]))
-      .toEqual([['a', 'ascii'], ['\u0301', 'highAnsi']]);
+      .toEqual([['a\u0301', 'ascii']]);
     expect(shape('a\u0301').graphemeBoundaries).toEqual([0, 2]);
     expect(shape('a\u0301').clusters).toEqual([
       { range: { start: 0, end: 2 }, offsetPt: 0, advancePt: 2 },
     ]);
-    expect(shape('a\u0301').spans.map((span) => span.breakBefore)).toEqual([true, false]);
+    expect(shape('a\u0301').spans.map((span) => span.breakBefore)).toEqual([true]);
     expect(shape('国\u{E0100}').spans.map((span) => [span.text, span.script]))
       .toEqual([['国\u{E0100}', 'eastAsia']]);
     expect(shape('\u{20000}').spans.map((span) => [span.text, span.script]))
@@ -339,8 +347,16 @@ describe('font layout services', () => {
       { range: { start: 0, end: 2 }, offsetPt: 0, advancePt: 1 },
       { range: { start: 2, end: 3 }, offsetPt: 1, advancePt: 1 },
     ]);
+    // Emoji ZWJ sequence: "👩"(eastAsia, supplementary plane) + ZWJ(U+200D,
+    // General Punctuation block, defaults to highAnsi) + "💻"(eastAsia) is
+    // ONE grapheme cluster end-to-end. Regression covered here: this used to
+    // assert 3 separate spans — that was the actual production bug (real
+    // Office and our own MD/KaTeX preview both render one combined "woman
+    // technologist" glyph; the native canvas engine rendered 3 loose glyphs
+    // because each span became its own fillText() call, so the ZWJ never got
+    // a chance to shape as a ligature with its neighbors).
     expect(shape('👩‍💻').spans.map((span) => [span.text, span.script]))
-      .toEqual([['👩', 'eastAsia'], ['\u200d', 'highAnsi'], ['💻', 'eastAsia']]);
+      .toEqual([['👩‍💻', 'eastAsia']]);
     expect(shape('𠀀').spans.flatMap((span) => [...span.text])).toEqual(['𠀀']);
     expect(shape('ش-12').spans.every((span) => span.script !== 'complexScript')).toBe(true);
   });
