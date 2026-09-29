@@ -101,14 +101,58 @@ fn read_zip_string(zip: &mut Zip, path: &str) -> Result<String, String> {
 
 fn open_document_body_projector(
     zip: &mut Zip,
+    document_part: &str,
 ) -> Result<DocumentBodyProjector<BufReader<PackageEntryStream>>, String> {
     let operation = zip.operation()?;
     let reporter = operation.limit_reporter()?;
-    let stream = operation.open_entry(DOCUMENT_PART)?;
+    let stream = operation.open_entry(document_part)?;
     Ok(DocumentBodyProjector::new(
         BufReader::new(stream),
         Some(reporter),
     ))
+}
+
+/// Resolve the package's main document part (§17.2, `<w:document>`) via the
+/// ROOT relationships part (`_rels/.rels`), instead of assuming the ECMA-376
+/// *convention* `word/document.xml`. ECMA-376 Part 2 §9.3.3 only mandates the
+/// relationship — Type ending in `/officeDocument` — not the part's actual
+/// name or directory; a compliant package may keep it anywhere (the `anydoc`
+/// fixture `handmade-altpath.docx` puts it at `content/main.xml`). Before this
+/// fix, every read in this module hardcoded `word/document.xml` (or a `word/`
+/// prefix for its siblings), so such a package's body part came back "entry
+/// not found" and the whole document silently degraded to an empty placeholder
+/// page — even though the package itself was perfectly well-formed.
+/// Falls back to the conventional path when the root rels are missing/
+/// unparsable or carry no `officeDocument` relationship, so every existing
+/// (convention-following) document is completely unaffected.
+fn resolve_document_part(zip: &mut Zip) -> String {
+    read_zip_string(zip, "_rels/.rels")
+        .ok()
+        .map(|xml| ooxml_common::rels::parse_rels(&xml))
+        .and_then(|rels| {
+            rels.values().find_map(|rel| {
+                let is_office_document = rel
+                    .relationship_type
+                    .as_deref()
+                    .is_some_and(|t| t.ends_with("/officeDocument"));
+                is_office_document.then(|| rel.resolve(""))
+            })
+        })
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| DOCUMENT_PART.to_string())
+}
+
+/// The directory portion of a resolved part path (e.g. `"word"` for
+/// `"word/document.xml"`, `"content"` for `"content/main.xml"`, `""` for a
+/// package-root part with no directory). Every sibling part (styles,
+/// numbering, settings, theme, media, fontTable, headers/footers, …) that
+/// falls back to a conventional name is joined against this directory instead
+/// of the hardcoded `"word"`.
+fn document_dir_of(document_part: &str) -> String {
+    document_part
+        .rsplit_once('/')
+        .map(|(dir, _)| dir.to_string())
+        .unwrap_or_default()
 }
 
 pub(crate) fn read_zip_bytes(zip: &mut Zip, path: &str) -> Result<Vec<u8>, String> {
@@ -748,6 +792,8 @@ pub(crate) fn parse_from_bytes_streamed_with_limits(
 }
 
 struct DocumentParseEnvironment {
+    document_part: String,
+    document_dir: String,
     rels_xml: String,
     rel_map: HashMap<String, String>,
     style_map: StyleMap,
@@ -766,52 +812,41 @@ struct DocumentParseEnvironment {
 /// styles, numbering, theme, relationships, and settings cannot drift between
 /// the two acquisition paths.
 fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
-    let rels_xml = read_zip_string(zip, "word/_rels/document.xml.rels").unwrap_or_default();
+    // Resolved from the ROOT rels (`_rels/.rels`'s `officeDocument` entry)
+    // instead of assumed — see `resolve_document_part` doc comment. Every
+    // sibling part below (styles/numbering/theme/settings/media/charts) that
+    // falls back to a conventional bare filename joins it against
+    // `document_dir` (this part's actual directory), not a hardcoded `"word"`.
+    let document_part = resolve_document_part(zip);
+    let document_dir = document_dir_of(&document_part);
+    let rels_xml =
+        read_zip_string(zip, &ooxml_common::rels::relationship_part_path(&document_part))
+            .unwrap_or_default();
     let rel_map = parse_rels(&rels_xml);
 
     // Styles are referenced from the document relationships (Target may be
-    // "styles.xml" or "styles2.xml"). Fall back to "word/styles.xml" for old files.
+    // "styles.xml" or "styles2.xml"). Fall back to "<document_dir>/styles.xml" for old files.
     let styles_path = find_rel_target(&rels_xml, "styles")
-        .map(|t| {
-            if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{}", t)
-            }
-        })
-        .unwrap_or_else(|| "word/styles.xml".to_string());
+        .map(|t| ooxml_common::rels::resolve_target(&document_dir, &t))
+        .unwrap_or_else(|| ooxml_common::rels::resolve_target(&document_dir, "styles.xml"));
     let mut style_map = read_zip_string(zip, &styles_path)
         .map(|s| StyleMap::parse(&s))
         .unwrap_or_else(|_| StyleMap::parse(""));
 
     let numbering_path = find_rel_target(&rels_xml, "numbering")
-        .map(|t| {
-            if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{}", t)
-            }
-        })
-        .unwrap_or_else(|| "word/numbering.xml".to_string());
+        .map(|t| ooxml_common::rels::resolve_target(&document_dir, &t))
+        .unwrap_or_else(|| ooxml_common::rels::resolve_target(&document_dir, "numbering.xml"));
     // The numbering part has its OWN relationships (`<part>.xml.rels`), needed to
     // resolve `<w:numPicBullet>` image r:ids (§17.9.26). Resolve them the same
     // way headers/footers do their per-part media (parse_rels + load_media_map),
     // derived from the numbering part's stem so a non-default numbering target
     // (e.g. "numbering2.xml") still finds its sibling rels.
     let numbering_media_map = {
-        let stem = numbering_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&numbering_path)
-            .trim_end_matches(".xml");
-        let dir = numbering_path
-            .rsplit_once('/')
-            .map(|(d, _)| d)
-            .unwrap_or("word");
-        let rels_path = format!("{}/_rels/{}.xml.rels", dir, stem);
+        let rels_path = ooxml_common::rels::relationship_part_path(&numbering_path);
+        let dir = document_dir_of(&numbering_path);
         let rels_xml = read_zip_string(zip, &rels_path).unwrap_or_default();
         let rel_map = parse_rels(&rels_xml);
-        load_media_map(zip, &rel_map, &format!("{}/", dir))
+        load_media_map(zip, &rel_map, &dir)
     };
     let num_map = read_zip_string(zip, &numbering_path)
         .map(|s| NumberingMap::parse(&s, &numbering_media_map))
@@ -821,14 +856,9 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     style_map.resolve_numbering_level_backlinks(&num_map);
 
     // Theme is referenced by a relationship with Type ending in "/theme" — resolve
-    // to word/<target> and parse the clrScheme.
-    let theme_path = find_rel_target(&rels_xml, "theme").map(|target| {
-        if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-        } else {
-            format!("word/{target}")
-        }
-    });
+    // against document_dir and parse the clrScheme.
+    let theme_path = find_rel_target(&rels_xml, "theme")
+        .map(|target| ooxml_common::rels::resolve_target(&document_dir, &target));
     let mut theme = match theme_path.as_deref() {
         Some(path) => read_zip_string(zip, path)
             .map(|xml| ThemeColors::parse(&xml))
@@ -852,14 +882,8 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     // §17.15.1.88 w:themeFontLang — when the theme leaves a cs typeface empty,
     // the settings' bidi language decides the actual complex-script face.
     let settings_path = find_rel_target(&rels_xml, "settings")
-        .map(|t| {
-            if t.starts_with('/') {
-                t.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{}", t)
-            }
-        })
-        .unwrap_or_else(|| "word/settings.xml".to_string());
+        .map(|t| ooxml_common::rels::resolve_target(&document_dir, &t))
+        .unwrap_or_else(|| ooxml_common::rels::resolve_target(&document_dir, "settings.xml"));
     let mut document_settings: Option<crate::types::DocumentSettings> = None;
     let mut page_layout_settings: Option<crate::types::PageLayoutSettingsWire> = None;
     let mut note_layout_settings: Option<crate::types::NoteLayoutSettingsWire> = None;
@@ -887,16 +911,18 @@ fn load_document_parse_environment(zip: &mut Zip) -> DocumentParseEnvironment {
     }
     let theme = theme;
 
-    let media_map = load_media_map(zip, &rel_map, "word/");
+    let media_map = load_media_map(zip, &rel_map, &document_dir);
 
     // ECMA-376 §21.2 — pre-resolve every chart part referenced from the document
     // relationships into the shared `ChartModel`, keyed by the SAME rId a
     // `<c:chart r:id>` in a `<w:drawing>` uses. Mirrors `load_media_map`: the
     // model is resolved here (needs `zip` + the theme, neither of which is
     // threaded through the run walk) and looked up by rId during drawing parse.
-    let chart_map = load_chart_map(zip, &rel_map, &theme);
+    let chart_map = load_chart_map(zip, &rel_map, &document_dir, &theme);
 
     DocumentParseEnvironment {
+        document_part,
+        document_dir,
         rels_xml,
         rel_map,
         style_map,
@@ -934,7 +960,7 @@ fn preflight_document_body(
     zip: &mut Zip,
     environment: &DocumentParseEnvironment,
 ) -> Result<DocumentBodyPreflight, String> {
-    let mut projector = open_document_body_projector(zip)?;
+    let mut projector = open_document_body_projector(zip, &environment.document_part)?;
     let mut sequence_facts = Vec::new();
     let mut sections = Vec::new();
     let mut running_refs = SectionRefs::default();
@@ -943,10 +969,15 @@ fn preflight_document_body(
     let mut ref_instructions = RefInstructionCollector::default();
 
     while let Some(block) = projector.next_block()? {
-        let xml = std::str::from_utf8(&block.xml)
-            .map_err(|error| format!("{DOCUMENT_PART}: projected block is not UTF-8: {error}"))?;
-        let document = parse_guarded(xml)
-            .map_err(|error| format!("{DOCUMENT_PART}: projected block: {error}"))?;
+        let xml = std::str::from_utf8(&block.xml).map_err(|error| {
+            format!(
+                "{}: projected block is not UTF-8: {error}",
+                environment.document_part
+            )
+        })?;
+        let document = parse_guarded(xml).map_err(|error| {
+            format!("{}: projected block: {error}", environment.document_part)
+        })?;
         let root = document.root_element();
         // The local names are independent of the namespace prefix. Reuse the
         // existing sectPr descendant walk, and skip field checks entirely for
@@ -1025,7 +1056,7 @@ fn preflight_document_body(
     let mut ref_leading_breaks = HashMap::new();
     if !ref_instructions.targets.is_empty() {
         drop(projector);
-        let mut projector = open_document_body_projector(zip)?;
+        let mut projector = open_document_body_projector(zip, &environment.document_part)?;
         let mut collector = LeadingBreakCollector::new(&ref_instructions.targets);
         while let Some(block) = projector.next_block()? {
             if block.local_name != "p" {
@@ -1033,10 +1064,14 @@ fn preflight_document_body(
                 continue;
             }
             let xml = std::str::from_utf8(&block.xml).map_err(|error| {
-                format!("{DOCUMENT_PART}: projected block is not UTF-8: {error}")
+                format!(
+                    "{}: projected block is not UTF-8: {error}",
+                    environment.document_part
+                )
             })?;
-            let document = parse_guarded(xml)
-                .map_err(|error| format!("{DOCUMENT_PART}: projected block: {error}"))?;
+            let document = parse_guarded(xml).map_err(|error| {
+                format!("{}: projected block: {error}", environment.document_part)
+            })?;
             collector.observe(document.root_element());
         }
         if projector.plan()? != plan {
@@ -1057,6 +1092,8 @@ fn preflight_document_body(
 
 pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     let mut environment = load_document_parse_environment(zip);
+    let document_part = environment.document_part.clone();
+    let document_dir = environment.document_dir.clone();
     let rel_map = &environment.rel_map;
     let style_map = &environment.style_map;
     let num_map = &mut environment.num_map;
@@ -1065,25 +1102,27 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     let chart_map = &environment.chart_map;
     let even_and_odd_headers = environment.even_and_odd_headers;
 
-    // RB7 partial degradation: `word/document.xml` is the body part. When it
-    // can't be read (missing / zip error) or parsed (malformed / a `<w:body>`
-    // that isn't there), don't fail the whole `parse()` with an opaque error —
-    // return a Document that still "opens" as a placeholder (empty body, the
-    // theme-derived fonts we can compute without the body) carrying a part-tagged
-    // `parse_error`, so the viewer shows a visible "this document is corrupt"
-    // page instead of nothing. A healthy document.xml takes the normal path and
-    // is byte-for-byte unchanged (`parse_error` stays `None`).
-    let doc_xml = match read_zip_string(zip, "word/document.xml") {
+    // RB7 partial degradation: the resolved main document part (conventionally
+    // `word/document.xml`, but see `resolve_document_part`) is the body part.
+    // When it can't be read (missing / zip error) or parsed (malformed / a
+    // `<w:body>` that isn't there), don't fail the whole `parse()` with an
+    // opaque error — return a Document that still "opens" as a placeholder
+    // (empty body, the theme-derived fonts we can compute without the body)
+    // carrying a part-tagged `parse_error`, so the viewer shows a visible
+    // "this document is corrupt" page instead of nothing. A healthy
+    // document part takes the normal path and is byte-for-byte unchanged
+    // (`parse_error` stays `None`).
+    let doc_xml = match read_zip_string(zip, &document_part) {
         Ok(xml) => xml,
-        Err(e) => return Ok(degraded_document(theme, format!("word/document.xml: {e}"))),
+        Err(e) => return Ok(degraded_document(theme, format!("{document_part}: {e}"))),
     };
     // `parse_guarded` runs the allocation-free depth pre-check BEFORE roxmltree's
     // tree builder (which recurses per element-nesting level and would overflow
     // the fixed WASM stack, trapping the whole parse, on a pathologically deep
-    // `word/document.xml`). Every attacker-controllable part is parsed this way.
+    // document part). Every attacker-controllable part is parsed this way.
     let xml_doc = match parse_guarded(&doc_xml) {
         Ok(doc) => doc,
-        Err(e) => return Ok(degraded_document(theme, format!("word/document.xml: {e}"))),
+        Err(e) => return Ok(degraded_document(theme, format!("{document_part}: {e}"))),
     };
 
     let body_node = match xml_doc
@@ -1095,7 +1134,7 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
         None => {
             return Ok(degraded_document(
                 theme,
-                "word/document.xml: no <w:body> element".to_string(),
+                format!("{document_part}: no <w:body> element"),
             ))
         }
     };
@@ -1129,8 +1168,24 @@ pub fn parse(zip: &mut Zip) -> Result<Document, String> {
     let mut body_headers = HeadersFooters::default();
     let mut body_footers = HeadersFooters::default();
     for (node_id, refs, title_page) in &section_snapshots {
-        let headers = load_header_footer_set(zip, &refs.headers, "hdr", style_map, num_map, theme);
-        let footers = load_header_footer_set(zip, &refs.footers, "ftr", style_map, num_map, theme);
+        let headers = load_header_footer_set(
+            zip,
+            &refs.headers,
+            "hdr",
+            &document_dir,
+            style_map,
+            num_map,
+            theme,
+        );
+        let footers = load_header_footer_set(
+            zip,
+            &refs.footers,
+            "ftr",
+            &document_dir,
+            style_map,
+            num_map,
+            theme,
+        );
         if Some(*node_id) == body_level_sect_id {
             body_headers = headers;
             body_footers = footers;
@@ -1218,6 +1273,7 @@ pub(crate) struct DocxBodyCursor {
 pub(crate) struct DocumentCursorFailure {
     error: String,
     theme: Box<ThemeColors>,
+    document_part: String,
 }
 
 impl DocumentCursorFailure {
@@ -1227,10 +1283,11 @@ impl DocumentCursorFailure {
     }
 
     pub(crate) fn into_degraded_document(self) -> Document {
-        let tagged = if self.error.starts_with("word/document.xml:") {
+        let prefix = format!("{}:", self.document_part);
+        let tagged = if self.error.starts_with(&prefix) {
             self.error
         } else {
-            format!("word/document.xml: {}", self.error)
+            format!("{prefix} {}", self.error)
         };
         degraded_document(&self.theme, tagged)
     }
@@ -1239,10 +1296,13 @@ impl DocumentCursorFailure {
 impl DocxBodyCursor {
     pub(crate) fn start(zip: &mut Zip) -> Result<Self, DocumentCursorFailure> {
         let mut environment = load_document_parse_environment(zip);
+        let document_part = environment.document_part.clone();
+        let document_dir = environment.document_dir.clone();
         let preflight =
             preflight_document_body(zip, &environment).map_err(|error| DocumentCursorFailure {
                 error,
                 theme: Box::new(environment.theme.clone()),
+                document_part: document_part.clone(),
             })?;
         let degraded_theme = environment.theme.clone();
 
@@ -1257,6 +1317,7 @@ impl DocxBodyCursor {
                 zip,
                 &fact.refs.headers,
                 "hdr",
+                &document_dir,
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
@@ -1265,6 +1326,7 @@ impl DocxBodyCursor {
                 zip,
                 &fact.refs.footers,
                 "ftr",
+                &document_dir,
                 &environment.style_map,
                 &mut environment.num_map,
                 &environment.theme,
@@ -1282,11 +1344,13 @@ impl DocxBodyCursor {
             }
         }
 
-        let projector =
-            open_document_body_projector(zip).map_err(|error| DocumentCursorFailure {
+        let projector = open_document_body_projector(zip, &document_part).map_err(|error| {
+            DocumentCursorFailure {
                 error,
                 theme: Box::new(degraded_theme.clone()),
-            })?;
+                document_part: document_part.clone(),
+            }
+        })?;
         Ok(Self {
             environment: Some(environment),
             plan: preflight.plan,
@@ -1313,9 +1377,15 @@ impl DocxBodyCursor {
     }
 
     fn failure(&self, error: String) -> DocumentCursorFailure {
+        let document_part = self
+            .environment
+            .as_ref()
+            .map(|environment| environment.document_part.clone())
+            .unwrap_or_else(|| DOCUMENT_PART.to_string());
         DocumentCursorFailure {
             error,
             theme: Box::new(self.degraded_theme.clone()),
+            document_part,
         }
     }
 
@@ -1377,11 +1447,16 @@ impl DocxBodyCursor {
             if block.ordinal >= self.table_sequences.len() {
                 return Err("document body changed between bounded passes".to_string());
             }
+            let document_part = self
+                .environment
+                .as_ref()
+                .map(|environment| environment.document_part.as_str())
+                .unwrap_or(DOCUMENT_PART);
             let xml = std::str::from_utf8(&block.xml).map_err(|error| {
-                format!("{DOCUMENT_PART}: projected block is not UTF-8: {error}")
+                format!("{document_part}: projected block is not UTF-8: {error}")
             })?;
             let document = parse_guarded(xml)
-                .map_err(|error| format!("{DOCUMENT_PART}: projected block: {error}"))?;
+                .map_err(|error| format!("{document_part}: projected block: {error}"))?;
             let root = document.root_element();
             let is_final_body_sect_pr = self.final_body_block_ordinal == Some(block.ordinal)
                 && block.local_name == "sectPr";
@@ -1531,31 +1606,20 @@ fn finish_document(
 
     // ECMA-376 §17.8.3.10: font family classification from fontTable.xml.
     // Resolve via relationship (Type ending in "/fontTable"); fall back to
-    // "word/fontTable.xml" for documents that omit the relationship.
+    // "<document_dir>/fontTable.xml" for documents that omit the relationship.
     let font_table_path = find_rel_target(&environment.rels_xml, "fontTable")
-        .map(|target| {
-            if target.starts_with('/') {
-                target.trim_start_matches('/').to_string()
-            } else {
-                format!("word/{target}")
-            }
-        })
-        .unwrap_or_else(|| "word/fontTable.xml".to_string());
+        .map(|target| ooxml_common::rels::resolve_target(&environment.document_dir, &target))
+        .unwrap_or_else(|| {
+            ooxml_common::rels::resolve_target(&environment.document_dir, "fontTable.xml")
+        });
     let font_table_xml = read_zip_string(zip, &font_table_path).unwrap_or_default();
     let (font_family_classes, font_family_pitches, font_family_charsets) =
         parse_font_table(&font_table_xml);
     // ECMA-376 §17.8.3.3-.6 — embedded fonts. The `<w:embed*>` r:ids resolve
     // through the fontTable part's OWN relationships.
     let embedded_fonts = {
-        let stem = font_table_path
-            .rsplit('/')
-            .next()
-            .unwrap_or(&font_table_path);
-        let dir = font_table_path
-            .rsplit_once('/')
-            .map(|(directory, _)| directory)
-            .unwrap_or("word");
-        let font_rels_path = format!("{dir}/_rels/{stem}.rels");
+        let dir = document_dir_of(&font_table_path);
+        let font_rels_path = ooxml_common::rels::relationship_part_path(&font_table_path);
         let font_rels_xml = read_zip_string(zip, &font_rels_path).unwrap_or_default();
         let font_rels = parse_rels(&font_rels_xml);
         parse_embedded_fonts(&font_table_xml, &font_rels, &format!("{dir}/"))
@@ -1563,7 +1627,7 @@ fn finish_document(
 
     let comments =
         find_internal_rel_target_by_types(&environment.rels_xml, COMMENTS_RELATIONSHIP_TYPES)
-            .map(|target| ooxml_common::rels::resolve_target("word/", &target))
+            .map(|target| ooxml_common::rels::resolve_target(&environment.document_dir, &target))
             .and_then(|p| read_zip_string(zip, &p).ok())
             .map(|xml| {
                 // [MS-DOCX] §2.5.3.1 — reply threading and resolved state live in
@@ -1575,20 +1639,17 @@ fn finish_document(
                     &environment.rels_xml,
                     COMMENTS_EXTENDED_RELATIONSHIP_TYPES,
                 )
-                .map(|target| ooxml_common::rels::resolve_target("word/", &target))
+                .map(|target| {
+                    ooxml_common::rels::resolve_target(&environment.document_dir, &target)
+                })
                 .and_then(|p| read_zip_string(zip, &p).ok())
                 .map(|extended_xml| parse_comments_extended(&extended_xml))
                 .unwrap_or_default();
                 parse_comments_with_extended(&xml, &extended)
             })
             .unwrap_or_default();
-    let footnotes_path = find_rel_target(&environment.rels_xml, "footnotes").map(|target| {
-        if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-        } else {
-            format!("word/{target}")
-        }
-    });
+    let footnotes_path = find_rel_target(&environment.rels_xml, "footnotes")
+        .map(|target| ooxml_common::rels::resolve_target(&environment.document_dir, &target));
     let footnotes = footnotes_path
         .map(|path| {
             parse_notes(
@@ -1601,13 +1662,8 @@ fn finish_document(
             )
         })
         .unwrap_or_default();
-    let endnotes_path = find_rel_target(&environment.rels_xml, "endnotes").map(|target| {
-        if target.starts_with('/') {
-            target.trim_start_matches('/').to_string()
-        } else {
-            format!("word/{target}")
-        }
-    });
+    let endnotes_path = find_rel_target(&environment.rels_xml, "endnotes")
+        .map(|target| ooxml_common::rels::resolve_target(&environment.document_dir, &target));
     let endnotes = endnotes_path
         .map(|path| {
             parse_notes(
@@ -1947,7 +2003,7 @@ fn parse_notes(
     let rels_xml = read_zip_string(zip, &rels_path).unwrap_or_default();
     let local_rel_map = parse_rels(&rels_xml);
     let local_media_map = load_media_map(zip, &local_rel_map, &base_dir);
-    let local_chart_map = load_chart_map(zip, &local_rel_map, theme);
+    let local_chart_map = load_chart_map(zip, &local_rel_map, &base_dir, theme);
 
     let Ok(doc) = parse_guarded(&xml) else {
         return Vec::new();
@@ -4286,17 +4342,18 @@ fn load_media_map(
 fn load_chart_map(
     zip: &mut Zip,
     rel_map: &HashMap<String, String>,
+    base_dir: &str,
     theme: &ThemeColors,
 ) -> HashMap<String, ooxml_common::chart::ChartModel> {
     // Resolve the rId's Type via the raw rels: `rel_map` only carries Targets,
     // but a chart Target is distinguishable by the part it lands on. Match on the
-    // resolved zip path living under `word/charts/` and ending in `.xml` — the
-    // canonical location for a DrawingML chart part. `parse_chart_part` returns
-    // `None` for a colors/style sidecar, so a stray non-chart `.xml` there is
-    // harmless.
+    // resolved zip path living under `<document_dir>/charts/` and ending in `.xml`
+    // — the canonical location for a DrawingML chart part. `parse_chart_part`
+    // returns `None` for a colors/style sidecar, so a stray non-chart `.xml` there
+    // is harmless.
     let mut chart_map: HashMap<String, ooxml_common::chart::ChartModel> = HashMap::new();
     for (rid, target) in rel_map {
-        let path = ooxml_common::rels::resolve_target("word/", target);
+        let path = ooxml_common::rels::resolve_target(base_dir, target);
         if !(path.contains("charts/") && path.ends_with(".xml")) {
             continue;
         }
@@ -4440,25 +4497,25 @@ fn load_header_footer_set(
     zip: &mut Zip,
     type_to_target: &HashMap<String, String>,
     root_tag: &str,
+    document_dir: &str,
     style_map: &StyleMap,
     num_map: &mut NumberingMap,
     theme: &ThemeColors,
 ) -> HeadersFooters {
     let mut out = HeadersFooters::default();
     for (kind, target) in type_to_target {
-        let path = format!("word/{}", target);
+        let path = ooxml_common::rels::resolve_target(document_dir, target);
         let xml = match read_zip_string(zip, &path) {
             Ok(s) => s,
             Err(_) => continue,
         };
 
         // Per-file rels for image resolution
-        let stem = target.trim_end_matches(".xml");
-        let rels_path = format!("word/_rels/{}.xml.rels", stem);
+        let rels_path = ooxml_common::rels::relationship_part_path(&path);
         let rels_xml = read_zip_string(zip, &rels_path).unwrap_or_default();
         let local_rel_map = parse_rels(&rels_xml);
-        let local_media_map = load_media_map(zip, &local_rel_map, "word/");
-        let local_chart_map = load_chart_map(zip, &local_rel_map, theme);
+        let local_media_map = load_media_map(zip, &local_rel_map, document_dir);
+        let local_chart_map = load_chart_map(zip, &local_rel_map, document_dir, theme);
 
         let xml_doc = match parse_guarded(&xml) {
             Ok(d) => d,
